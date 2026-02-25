@@ -57,7 +57,10 @@ curl -s --max-time 1 http://127.0.0.1:<port>/json/version
 
 ```bash
 ./scripts/browser-lock.sh run scripts/my-task.js [args...]
+./scripts/browser-lock.sh run --timeout 120 scripts/my-task.js  # custom timeout
 ```
+
+Default timeout: 300s. If the script exceeds it, the watchdog kills it and releases the lock.
 
 This automatically: checks lock → stops OpenClaw browser → starts Chrome with CDP → runs script → cleans up → releases lock.
 
@@ -199,3 +202,4 @@ The lock file (`/tmp/openclaw-browser.lock`) prevents concurrent browser access.
 |-----|---------|-------------|
 | `CDP_PORT` | auto-discover | Override CDP port (skips process detection) |
 | `CHROME_BIN` | auto-detect | Path to Chrome/Chromium binary |
+| `HEADLESS` | auto | Set `true`/`1` to force headless; `false`/`0` to force headed. Auto-detects on Linux without DISPLAY |
