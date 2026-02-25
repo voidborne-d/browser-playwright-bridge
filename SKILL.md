@@ -10,7 +10,7 @@ OpenClaw's browser tool and external Playwright scripts cannot share the same CD
 ## Architecture
 
 ```
-Chrome (CDP :18800)  ←  shared user-data-dir (~/.openclaw/browser/openclaw/user-data)
+Chrome (CDP port)  ←  shared user-data-dir (~/.openclaw/browser/openclaw/user-data)
        ↕ mutually exclusive
 ┌──────────────┐    ┌──────────────────┐
 │ OpenClaw     │ OR │ Playwright script │
@@ -21,16 +21,34 @@ Chrome (CDP :18800)  ←  shared user-data-dir (~/.openclaw/browser/openclaw/use
 
 ## Setup
 
-Install Playwright in the workspace (once):
+1. Install Playwright in the workspace (once):
 
 ```bash
 cd <workspace> && npm install playwright
 ```
 
-Copy `scripts/browser-lock.sh` to your workspace `scripts/` directory and make it executable:
+> **Note:** `npx playwright install` is NOT needed. Playwright connects to the existing Chrome via CDP — no local browser download required.
+
+2. Copy `scripts/browser-lock.sh` to your workspace `scripts/` directory:
 
 ```bash
 chmod +x scripts/browser-lock.sh
+```
+
+## Discovering the CDP Port
+
+The CDP port is dynamically assigned. **Never hardcode it.** Use `discoverCdpUrl()` (see below) or the shell equivalent in `browser-lock.sh`.
+
+Shell one-liner:
+
+```bash
+ps aux | grep 'remote-debugging-port=' | grep -v grep | grep -o 'remote-debugging-port=[0-9]*' | head -1 | cut -d= -f2
+```
+
+Verify CDP is responding:
+
+```bash
+curl -s --max-time 1 http://127.0.0.1:<port>/json/version
 ```
 
 ## Usage
@@ -59,19 +77,77 @@ node scripts/my-task.js              # run script(s)
 
 ## Writing Playwright Scripts
 
-Use `scripts/playwright-template.js` as starting point. Key rules:
+Use `scripts/playwright-template.js` as starting point.
+
+### CDP Discovery Helper
+
+All scripts should use `discoverCdpUrl()` instead of hardcoding a port:
+
+```javascript
+const { execSync } = require('child_process');
+
+/**
+ * Discover the CDP URL by inspecting Chrome process args.
+ * Falls back to CDP_PORT env var, then probes common ports.
+ */
+function discoverCdpUrl() {
+  // Method 1: extract from running Chrome process
+  try {
+    const ps = execSync(
+      "ps aux | grep 'remote-debugging-port=' | grep -v grep",
+      { encoding: 'utf8', timeout: 3000 }
+    );
+    const match = ps.match(/remote-debugging-port=(\d+)/);
+    if (match) return `http://127.0.0.1:${match[1]}`;
+  } catch {}
+
+  // Method 2: CDP_PORT env var
+  if (process.env.CDP_PORT) {
+    return `http://127.0.0.1:${process.env.CDP_PORT}`;
+  }
+
+  // Method 3: probe common ports
+  // 18800 is the typical OpenClaw default; others are common CDP conventions
+  const { execSync: probe } = require('child_process');
+  for (const port of [18800, 9222, 9229]) {
+    try {
+      probe(`curl -s --max-time 1 http://127.0.0.1:${port}/json/version`, {
+        encoding: 'utf8', timeout: 2000
+      });
+      return `http://127.0.0.1:${port}`;
+    } catch {}
+  }
+
+  throw new Error('CDP port not found. Is Chrome running with --remote-debugging-port?');
+}
+```
+
+### Script Pattern
 
 ```javascript
 const { chromium } = require('playwright');
 
 async function main() {
-  // Connect to the standalone Chrome started by browser-lock.sh
-  const browser = await chromium.connectOverCDP('http://127.0.0.1:18800');
+  let browser;
+  try {
+    browser = await chromium.connectOverCDP(discoverCdpUrl());
+  } catch (e) {
+    console.error('❌ Cannot connect to Chrome CDP:', e.message);
+    console.error('   Ensure browser-lock.sh acquire was called, or Chrome is running with --remote-debugging-port');
+    process.exit(1);
+  }
+
   const context = browser.contexts()[0]; // reuse existing context (cookies!)
   const page = await context.newPage();
 
   try {
-    // ... your automation ...
+    // ====== Your automation here ======
+    await page.goto('https://example.com');
+    console.log('Title:', await page.title());
+    // ==================================
+  } catch (e) {
+    console.error('❌ Script error:', e.message);
+    throw e;
   } finally {
     await page.close();     // close only your tab
     // NEVER call browser.close() — it kills the entire Chrome
@@ -84,11 +160,11 @@ main().then(() => process.exit(0)).catch(e => {
 });
 ```
 
-**Critical:**
+**Critical rules:**
 - `browser.contexts()[0]` — reuse the existing context to inherit cookies/login
-- `page.close()` only — never `browser.close()`
+- `page.close()` only — **never `browser.close()`**
 - Always `process.exit(0)` on success — Playwright keeps event loops alive otherwise
-- CDP port defaults to 18800; override with `CDP_PORT` env var
+- Wrap `connectOverCDP` in try-catch — fail fast with a clear message
 
 ## Workflow: Explore → Record → Replay
 
@@ -110,15 +186,16 @@ The lock file (`/tmp/openclaw-browser.lock`) prevents concurrent browser access.
 
 | Problem | Fix |
 |---------|-----|
-| `Lock held by PID xxx` | Run `./scripts/browser-lock.sh release` to force-release |
-| Playwright connectOverCDP timeout | Ensure OpenClaw browser is stopped first (that's what `acquire` does) |
-| `openclaw browser stop` doesn't work | Known issue; browser-lock.sh kills the process directly |
-| Script hangs after completion | Add `process.exit(0)` at the end of your main function |
+| `Lock held by PID xxx` | `./scripts/browser-lock.sh release` to force-release |
+| Playwright connectOverCDP timeout | Ensure OpenClaw browser is stopped first (`acquire` does this) |
+| `CDP port not found` | Chrome isn't running; call `browser-lock.sh acquire` first |
+| `openclaw browser stop` doesn't kill Chrome | Known issue; browser-lock.sh kills the process directly |
+| Script hangs after completion | Add `process.exit(0)` at the end |
 | Login expired | Use OpenClaw browser tool to re-login, then run scripts again |
 
 ## Environment Variables
 
 | Var | Default | Description |
 |-----|---------|-------------|
-| `CDP_PORT` | 18800 | Chrome DevTools Protocol port |
+| `CDP_PORT` | auto-discover | Override CDP port (skips process detection) |
 | `CHROME_BIN` | auto-detect | Path to Chrome/Chromium binary |
